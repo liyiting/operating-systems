@@ -1,0 +1,858 @@
+diff --git a/arch/x86/configs/goldfish_defconfig b/arch/x86/configs/goldfish_defconfig
+index 78949aa..44f5fa1 100644
+--- a/arch/x86/configs/goldfish_defconfig
++++ b/arch/x86/configs/goldfish_defconfig
+@@ -72,6 +72,7 @@ CONFIG_CLASSIC_RCU=y
+ # CONFIG_IKCONFIG is not set
+ CONFIG_LOG_BUF_SHIFT=17
+ CONFIG_HAVE_UNSTABLE_SCHED_CLOCK=y
++CONFIG_EDF_SCHED=y
+ CONFIG_GROUP_SCHED=y
+ CONFIG_FAIR_GROUP_SCHED=y
+ # CONFIG_RT_GROUP_SCHED is not set
+diff --git a/arch/x86/include/asm/unistd_32.h b/arch/x86/include/asm/unistd_32.h
+index f2bba78..35bf274 100644
+--- a/arch/x86/include/asm/unistd_32.h
++++ b/arch/x86/include/asm/unistd_32.h
+@@ -338,6 +338,9 @@
+ #define __NR_dup3		330
+ #define __NR_pipe2		331
+ #define __NR_inotify_init1	332
++#define __NR_net_lock		333
++#define __NR_net_unlock		334
++#define __NR_net_lock_wait_timeout	335
+ 
+ #ifdef __KERNEL__
+ 
+diff --git a/arch/x86/kernel/syscall_table_32.S b/arch/x86/kernel/syscall_table_32.S
+index e2e86a0..860e24d 100644
+--- a/arch/x86/kernel/syscall_table_32.S
++++ b/arch/x86/kernel/syscall_table_32.S
+@@ -332,3 +332,6 @@ ENTRY(sys_call_table)
+ 	.long sys_dup3			/* 330 */
+ 	.long sys_pipe2
+ 	.long sys_inotify_init1
++	.long sys_net_lock
++	.long sys_net_unlock
++	.long sys_net_lock_wait_timeout	/* 335 */
+diff --git a/include/linux/init_task.h b/include/linux/init_task.h
+index e752d97..435ab0d 100644
+--- a/include/linux/init_task.h
++++ b/include/linux/init_task.h
+@@ -146,6 +146,12 @@ extern struct cred init_cred;
+ 		.time_slice	= HZ, 					\
+ 		.nr_cpus_allowed = NR_CPUS,				\
+ 	},								\
++	.edf		= {						\
++		.run_list	= LIST_HEAD_INIT(tsk.edf.run_list),	\
++		.timeout	= 0,					\
++	},								\
++	.curr_lock	= NET_LOCK_N,					\
++	.wait_list	= LIST_HEAD_INIT(tsk.wait_list),		\
+ 	.tasks		= LIST_HEAD_INIT(tsk.tasks),			\
+ 	.ptraced	= LIST_HEAD_INIT(tsk.ptraced),			\
+ 	.ptrace_entry	= LIST_HEAD_INIT(tsk.ptrace_entry),		\
+diff --git a/include/linux/netlock.h b/include/linux/netlock.h
+new file mode 100644
+index 0000000..739e79b
+--- /dev/null
++++ b/include/linux/netlock.h
+@@ -0,0 +1,14 @@
++#include <linux/sched.h>
++
++#define INIT_NETLOCK(nls) {						\
++	.lock = __SPIN_LOCK_UNLOCKED(nls.lock),				\
++	.wait_r = 0,							\
++	.count_r = 0,							\
++	.count_w = 0,							\
++	.timer_on = 0,							\
++	.queue_r = __WAIT_QUEUE_HEAD_INITIALIZER(nls.queue_r),		\
++	.queue_w = __WAIT_QUEUE_HEAD_INITIALIZER(nls.queue_w),		\
++	.wait_head = LIST_HEAD_INIT(nls.wait_head),			\
++}
++
++void exit_release_lock(struct task_struct *p);
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 011db2f..1ab3710 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -38,6 +38,7 @@
+ #define SCHED_BATCH		3
+ /* SCHED_ISO: reserved but not implemented yet */
+ #define SCHED_IDLE		5
++#define SCHED_EDF		6
+ 
+ #ifdef __KERNEL__
+ 
+@@ -1111,6 +1112,11 @@ struct sched_rt_entity {
+ #endif
+ };
+ 
++struct sched_edf_entity {
++	struct list_head run_list;
++	unsigned long timeout;
++};
++
+ struct task_struct {
+ 	volatile long state;	/* -1 unrunnable, 0 runnable, >0 stopped */
+ 	void *stack;
+@@ -1131,6 +1137,11 @@ struct task_struct {
+ 	const struct sched_class *sched_class;
+ 	struct sched_entity se;
+ 	struct sched_rt_entity rt;
++	struct sched_edf_entity edf;
++	netlock_t curr_lock;
++	unsigned int ori_policy;
++	int ori_prio;
++	struct list_head wait_list;
+ 
+ #ifdef CONFIG_PREEMPT_NOTIFIERS
+ 	/* list of struct preempt_notifier: */
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index f9f900c..c549fcc 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -691,6 +691,9 @@ asmlinkage long sys_ppoll(struct pollfd __user *, unsigned int,
+ 			  size_t);
+ asmlinkage long sys_pipe2(int __user *, int);
+ asmlinkage long sys_pipe(int __user *);
++asmlinkage long sys_net_lock(netlock_t type, u_int16_t timeout_val);
++asmlinkage long sys_net_unlock(void);
++asmlinkage long sys_net_lock_wait_timeout(void);
+ 
+ int kernel_execve(const char *filename, char *const argv[], char *const envp[]);
+ 
+diff --git a/include/linux/types.h b/include/linux/types.h
+index 712ca53..2dee887 100644
+--- a/include/linux/types.h
++++ b/include/linux/types.h
+@@ -11,6 +11,14 @@
+ #include <linux/posix_types.h>
+ #include <asm/types.h>
+ 
++enum __netlock_t {
++	NET_LOCK_N,
++	NET_LOCK_R,
++	NET_LOCK_W,
++};
++typedef enum __netlock_t netlock_t;
++
++
+ #ifndef __KERNEL_STRICT_NAMES
+ 
+ typedef __u32 __kernel_dev_t;
+diff --git a/init/Kconfig b/init/Kconfig
+index bc99154..0894d06 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -369,6 +369,11 @@ config LOG_BUF_SHIFT
+ config HAVE_UNSTABLE_SCHED_CLOCK
+ 	bool
+ 
++config EDF_SCHED
++	bool "Scheduler Specified to Processes Holding Net_lock"
++	help
++	  http://www.cs.columbia.edu/~krj/os/homework.html
++
+ config GROUP_SCHED
+ 	bool "Group CPU scheduler"
+ 	depends on EXPERIMENTAL
+diff --git a/kernel/Makefile b/kernel/Makefile
+index e4791b3..34fea09 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -10,7 +10,7 @@ obj-y     = sched.o fork.o exec_domain.o panic.o printk.o \
+ 	    kthread.o wait.o kfifo.o sys_ni.o posix-cpu-timers.o mutex.o \
+ 	    hrtimer.o rwsem.o nsproxy.o srcu.o semaphore.o \
+ 	    notifier.o ksysfs.o pm_qos_params.o sched_clock.o cred.o \
+-	    async.o
++	    async.o netlock.o
+ 
+ ifdef CONFIG_FUNCTION_TRACER
+ # Do not trace debug files and internal ftrace files
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 615278b..0f0bc92 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -49,6 +49,8 @@
+ #include <linux/init_task.h>
+ #include <trace/sched.h>
+ 
++#include <linux/netlock.h>
++
+ #include <asm/uaccess.h>
+ #include <asm/unistd.h>
+ #include <asm/pgtable.h>
+@@ -1090,6 +1092,8 @@ NORET_TYPE void do_exit(long code)
+ 	exit_thread();
+ 	cgroup_exit(tsk, 1);
+ 
++	exit_release_lock(tsk);
++
+ 	if (group_dead && tsk->signal->leader)
+ 		disassociate_ctty(1);
+ 
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 820f0ff..7f734b2 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1021,6 +1021,9 @@ static struct task_struct *copy_process(unsigned long clone_flags,
+ 	copy_flags(clone_flags, p);
+ 	INIT_LIST_HEAD(&p->children);
+ 	INIT_LIST_HEAD(&p->sibling);
++
++	INIT_LIST_HEAD(&p->wait_list);
++
+ #ifdef CONFIG_PREEMPT_RCU
+ 	p->rcu_read_lock_nesting = 0;
+ 	p->rcu_flipctr_idx = 0;
+@@ -1041,6 +1044,8 @@ static struct task_struct *copy_process(unsigned long clone_flags,
+ 
+ 	p->default_timer_slack_ns = current->timer_slack_ns;
+ 
++	p->curr_lock = NET_LOCK_N;
++
+ #ifdef CONFIG_DETECT_SOFTLOCKUP
+ 	p->last_switch_count = 0;
+ 	p->last_switch_timestamp = 0;
+diff --git a/kernel/netlock.c b/kernel/netlock.c
+new file mode 100644
+index 0000000..3c75e36
+--- /dev/null
++++ b/kernel/netlock.c
+@@ -0,0 +1,250 @@
++/*
++ * Solution of w4118: Operating Systems HW3
++ * Spring 2013, Columbia University
++ * Instructor: Prof. Joshi
++ * Course Website: http://www.cs.columbia.edu/~krj/os/
++ *
++ * Implement a reader-writer "net-lock" synchronization primitive that
++ * prioritizes readers.
++ *
++ */
++
++#include <linux/jiffies.h>
++#include <linux/kernel.h>
++#include <linux/list.h>
++#include <linux/netlock.h>
++#include <linux/sched.h>
++#include <linux/spinlock.h>
++#include <linux/syscalls.h>
++#include <linux/wait.h>
++
++#define SEC_TO_MSEC	1000
++#define EDF_DEFAULT_PRIO	0
++
++struct lock_struct {
++	spinlock_t lock;		/* protect shared data */
++	int wait_r;			/* waiting readers */
++	int count_r;			/* readers who grab the lock */
++	int count_w;			/* writers who grab the lock */
++	int timer_on;			/* flag: whether the timer is added */
++	wait_queue_head_t queue_r;	/* readers wait queue */
++	wait_queue_head_t queue_w;	/* writers wait queue */
++	struct list_head wait_head;	/* keep track of timeout values */
++};
++
++static struct lock_struct netlock_evt = INIT_NETLOCK(netlock_evt);
++
++/* Used to block monitor in net_lock_wait_timeout */
++static wait_queue_head_t wait_tout = __WAIT_QUEUE_HEAD_INITIALIZER(wait_tout);
++
++static void wake_up_monitor(unsigned long data)
++{
++	spin_lock_irq(&netlock_evt.lock);
++	wake_up_all(&wait_tout);
++
++	netlock_evt.timer_on = 0;
++	spin_unlock_irq(&netlock_evt.lock);
++}
++
++/* Timer struct to wake up monitor */
++static DEFINE_TIMER(mon_timer, wake_up_monitor, 0, 0);
++
++SYSCALL_DEFINE2(net_lock, netlock_t, type, u_int16_t, timeout_val)
++{
++	struct task_struct *p = current;
++	struct task_struct *tmp;
++	struct sched_param param;
++	int err;
++	DEFINE_WAIT(__wait);
++
++	/* Prevent request of lock while already hold a lock */
++	if (p->curr_lock != NET_LOCK_N ||
++		(type != NET_LOCK_R && type != NET_LOCK_W))
++		return -EINVAL;
++
++	/* Read lock */
++	if (type == NET_LOCK_R) {
++		param.sched_priority = EDF_DEFAULT_PRIO;
++		p->edf.timeout = jiffies + msecs_to_jiffies(timeout_val *
++								SEC_TO_MSEC);
++		spin_lock_irq(&netlock_evt.lock);
++
++		/* Block when there are writers */
++		if (netlock_evt.count_w != 0) {
++			list_for_each_entry(tmp, &netlock_evt.wait_head,
++								wait_list) {
++				if (tmp->edf.timeout > p->edf.timeout)
++					break;
++			}
++			/* If added next to head, update timer */
++			if (tmp->wait_list.prev == &netlock_evt.wait_head) {
++				if (netlock_evt.timer_on == 0) {
++					mon_timer.expires = p->edf.timeout;
++					add_timer(&mon_timer);
++					netlock_evt.timer_on = 1;
++				} else {
++					mod_timer(&mon_timer, p->edf.timeout);
++				}
++			}
++			list_add(&p->wait_list, tmp->wait_list.prev);
++			netlock_evt.wait_r++;
++			prepare_to_wait(&netlock_evt.queue_r, &__wait,
++					TASK_INTERRUPTIBLE);
++			/*
++			 * Release spin_lock after being enqueued to guarantee
++			 * that the reader can be woken up by the next
++			 * write unlock (e.g. when timeout_val == 0)
++			 */
++			spin_unlock_irq(&netlock_evt.lock);
++
++			if (!signal_pending(current))
++				schedule();
++
++			spin_lock_irq(&netlock_evt.lock);
++			finish_wait(&netlock_evt.queue_r, &__wait);
++			netlock_evt.wait_r--;
++			netlock_evt.count_r++;
++
++			/*
++			 * If the process is woken up by interrupt
++			 * (e.g. termination)
++			 */
++			if (signal_pending(current)) {
++				/* head.next exit, update timer */
++				if (p->wait_list.prev ==
++						&netlock_evt.wait_head) {
++					if (p->wait_list.next !=
++						&netlock_evt.wait_head) {
++						tmp = list_entry(
++							p->wait_list.next,
++							struct task_struct,
++							wait_list);
++						mod_timer(&mon_timer,
++							tmp->edf.timeout);
++
++					/* only one on list, del timer */
++					} else {
++						del_timer_sync(&mon_timer);
++						netlock_evt.timer_on = 0;
++					}
++				}
++				list_del_init(&p->wait_list);
++				spin_unlock_irq(&netlock_evt.lock);
++
++				/*
++				 * Set it to reader for we still need to call
++				 * a read unlock to wake up writers
++				 * (waiting readers can also block writers)
++				 */
++				p->curr_lock = NET_LOCK_R;
++				return -EINTR;
++			}
++
++			list_del_init(&p->wait_list);
++			spin_unlock_irq(&netlock_evt.lock);
++
++		/* No writers, directly grab lock */
++		} else {
++			netlock_evt.count_r++;
++			spin_unlock_irq(&netlock_evt.lock);
++		}
++
++		p->curr_lock = NET_LOCK_R;
++		p->ori_policy = p->policy;
++		p->ori_prio = p->prio;
++		err = sched_setscheduler(p, 6, &param);
++
++	/* Write lock */
++	} else {
++		spin_lock_irq(&netlock_evt.lock);
++		/* block when there are readers running or ***waiting*** */
++		if (netlock_evt.count_r != 0 || netlock_evt.wait_r != 0) {
++			prepare_to_wait(&netlock_evt.queue_w, &__wait,
++					TASK_INTERRUPTIBLE);
++			spin_unlock_irq(&netlock_evt.lock);
++
++			if (!signal_pending(current))
++				schedule();
++
++			spin_lock_irq(&netlock_evt.lock);
++			finish_wait(&netlock_evt.queue_r, &__wait);
++
++			if (signal_pending(current)) {
++				spin_unlock_irq(&netlock_evt.lock);
++				return -EINTR;
++			}
++
++			netlock_evt.count_w++;
++			spin_unlock_irq(&netlock_evt.lock);
++
++		/* directly grab write lock */
++		} else {
++
++			netlock_evt.count_w++;
++			spin_unlock_irq(&netlock_evt.lock);
++
++		}
++		p->curr_lock = NET_LOCK_W;
++
++	}
++
++	return 0;
++}
++
++SYSCALL_DEFINE0(net_unlock)
++{
++	struct task_struct *p = current;
++	struct sched_param param;
++
++	if (p->curr_lock != NET_LOCK_R && p->curr_lock != NET_LOCK_W)
++		return -EINVAL;
++
++	exit_release_lock(p);
++
++	/* set scheduler back for readers */
++	if (p->curr_lock == NET_LOCK_R) {
++		param.sched_priority = p->ori_prio;
++		sched_setscheduler(p, p->ori_policy, &param);
++	}
++	p->curr_lock = NET_LOCK_N;
++
++	return 0;
++}
++
++SYSCALL_DEFINE0(net_lock_wait_timeout)
++{
++	/* wait to be woken up by timer */
++	DEFINE_WAIT(__wait);
++	prepare_to_wait(&wait_tout, &__wait, TASK_INTERRUPTIBLE);
++
++	/* It's OK for net_lock_wait_timeout to return when receive signals */
++	if (!signal_pending(current))
++		schedule();
++
++	finish_wait(&wait_tout, &__wait);
++
++	return 0;
++}
++
++void exit_release_lock(struct task_struct *p)
++{
++	/* read unlock */
++	if (p->curr_lock == NET_LOCK_R) {
++
++		spin_lock_irq(&netlock_evt.lock);
++		netlock_evt.count_r--;
++		if (netlock_evt.count_r == 0 && netlock_evt.wait_r == 0)
++			wake_up_all(&netlock_evt.queue_w);
++		spin_unlock_irq(&netlock_evt.lock);
++
++	/* write unlock */
++	} else if (p->curr_lock == NET_LOCK_W) {
++
++		spin_lock_irq(&netlock_evt.lock);
++		netlock_evt.count_w--;
++		if (netlock_evt.count_w == 0)
++			wake_up_all(&netlock_evt.queue_r);
++		spin_unlock_irq(&netlock_evt.lock);
++
++	}
++}
+diff --git a/kernel/sched.c b/kernel/sched.c
+index 10330ea..d7c8988 100644
+--- a/kernel/sched.c
++++ b/kernel/sched.c
+@@ -489,6 +489,12 @@ struct rt_rq {
+ #endif
+ };
+ 
++struct edf_rq {
++	struct list_head run_head;	/* head of run list */
++	unsigned long edf_nr_running;
++	u_int16_t prob_count;
++};
++
+ #ifdef CONFIG_SMP
+ 
+ /*
+@@ -561,6 +567,7 @@ struct rq {
+ 
+ 	struct cfs_rq cfs;
+ 	struct rt_rq rt;
++	struct edf_rq edf;
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	/* list of leaf cfs_rq on this cpu: */
+@@ -1657,6 +1664,7 @@ static void cfs_rq_set_shares(struct cfs_rq *cfs_rq, unsigned long shares)
+ #include "sched_stats.h"
+ #include "sched_idletask.c"
+ #include "sched_fair.c"
++#include "sched_edf.c"
+ #include "sched_rt.c"
+ #ifdef CONFIG_SCHED_DEBUG
+ # include "sched_debug.c"
+@@ -2401,6 +2409,8 @@ static void __sched_fork(struct task_struct *p)
+ 
+ 	INIT_LIST_HEAD(&p->rt.run_list);
+ 	p->se.on_rq = 0;
++	INIT_LIST_HEAD(&p->edf.run_list);
++	p->edf.timeout = 0;
+ 	INIT_LIST_HEAD(&p->se.group_node);
+ 
+ #ifdef CONFIG_PREEMPT_NOTIFIERS
+@@ -5289,6 +5299,9 @@ __setscheduler(struct rq *rq, struct task_struct *p, int policy, int prio)
+ 	case SCHED_RR:
+ 		p->sched_class = &rt_sched_class;
+ 		break;
++	case SCHED_EDF:
++		p->sched_class = &edf_sched_class;
++		break;
+ 	}
+ 
+ 	p->rt_priority = prio;
+@@ -5330,8 +5343,9 @@ recheck:
+ 		policy = oldpolicy = p->policy;
+ 	else if (policy != SCHED_FIFO && policy != SCHED_RR &&
+ 			policy != SCHED_NORMAL && policy != SCHED_BATCH &&
+-			policy != SCHED_IDLE)
++			policy != SCHED_IDLE && policy != SCHED_EDF)
+ 		return -EINVAL;
++	/* printk("w4118: __sched_setscheduler 0\n"); */
+ 	/*
+ 	 * Valid priorities for SCHED_FIFO and SCHED_RR are
+ 	 * 1..MAX_USER_RT_PRIO-1, valid priority for SCHED_NORMAL,
+@@ -5341,9 +5355,14 @@ recheck:
+ 	    (p->mm && param->sched_priority > MAX_USER_RT_PRIO-1) ||
+ 	    (!p->mm && param->sched_priority > MAX_RT_PRIO-1))
+ 		return -EINVAL;
+-	if (rt_policy(policy) != (param->sched_priority != 0))
++
++	/* printk("w4118: __sched_setscheduler 0.5\n"); */
++	if (rt_policy(policy) != (param->sched_priority != 0) &&
++		policy != SCHED_EDF)
+ 		return -EINVAL;
+ 
++	/* printk("w4118: __sched_setscheduler 1\n"); */
++
+ 	/*
+ 	 * Allow unprivileged RT tasks to decrease priority:
+ 	 */
+@@ -5377,6 +5396,8 @@ recheck:
+ 			return -EPERM;
+ 	}
+ 
++	/* printk("w4118: __sched_setscheduler 2\n"); */
++
+ 	if (user) {
+ #ifdef CONFIG_RT_GROUP_SCHED
+ 		/*
+@@ -5503,6 +5524,8 @@ SYSCALL_DEFINE3(sched_setscheduler, pid_t, pid, int, policy,
+ 	if (policy < 0)
+ 		return -EINVAL;
+ 
++	/* printk("w4118: syscall sched_setscheduler called %u\n", pid); */
++
+ 	return do_sched_setscheduler(pid, policy, param);
+ }
+ 
+@@ -8294,6 +8317,13 @@ static void init_rt_rq(struct rt_rq *rt_rq, struct rq *rq)
+ #endif
+ }
+ 
++static void init_edf_rq(struct edf_rq *edf_rq)
++{
++	INIT_LIST_HEAD(&edf_rq->run_head);
++	edf_rq->edf_nr_running = 0;
++	edf_rq->prob_count = 0;
++}
++
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ static void init_tg_cfs_entry(struct task_group *tg, struct cfs_rq *cfs_rq,
+ 				struct sched_entity *se, int cpu, int add,
+@@ -8441,6 +8471,9 @@ void __init sched_init(void)
+ 		rq->nr_running = 0;
+ 		init_cfs_rq(&rq->cfs, rq);
+ 		init_rt_rq(&rq->rt, rq);
++#ifdef CONFIG_EDF_SCHED
++		init_edf_rq(&rq->edf);
++#endif
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 		init_task_group.shares = init_task_group_load;
+ 		INIT_LIST_HEAD(&rq->leaf_cfs_rq_list);
+diff --git a/kernel/sched_edf.c b/kernel/sched_edf.c
+new file mode 100644
+index 0000000..f8d628d
+--- /dev/null
++++ b/kernel/sched_edf.c
+@@ -0,0 +1,245 @@
++/*
++ * Sched class specified to schedule processes which grabs a reader netlock
++ * processes are scheduled in the order of their timeout
++ */
++
++static const struct sched_class edf_sched_class;
++
++static inline struct task_struct *edf_task_of(struct sched_edf_entity *edf_se)
++{
++	return container_of(edf_se, struct task_struct, edf);
++}
++
++/*
++ * Update the current task's runtime statistics. Skip current tasks that
++ * are not in edf_sched_class.
++ */
++static void update_curr_edf(struct rq *rq)
++{
++	struct task_struct *curr = rq->curr;
++	u64 delta_exec;
++
++	if (curr->sched_class != &edf_sched_class)
++		return;
++
++	delta_exec = rq->clock - curr->se.exec_start;
++	if (unlikely((s64)delta_exec < 0))
++		delta_exec = 0;
++
++	schedstat_set(curr->se.exec_max, max(curr->se.exec_max, delta_exec));
++
++	curr->se.sum_exec_runtime += delta_exec;
++	account_group_exec_runtime(curr, delta_exec);
++
++	curr->se.exec_start = rq->clock;
++	cpuacct_charge(curr, delta_exec);
++}
++
++/*
++ * A task is activated into runnable state.
++ * Enqueue the task to the runqueue in order of timeout.
++ * Preemption if inserted on head will be handled by check_preempt_curr_edf
++ * and switched_to_edf
++ */
++static void enqueue_task_edf(struct rq *rq, struct task_struct *p, int flags)
++{
++	struct edf_rq *edf_rq = &rq->edf;
++	struct sched_edf_entity *edf_se = &p->edf;
++	struct sched_edf_entity *pos;
++	struct list_head *tmp;
++
++	list_for_each_entry(pos, &rq->edf.run_head, run_list) {
++		if (pos->timeout > p->edf.timeout)
++			break;
++	}
++
++	tmp = pos->run_list.prev;
++	list_add(&edf_se->run_list, tmp);
++	edf_rq->edf_nr_running++;
++}
++
++/*
++ * A task is deactivated.
++ * Removes the task from the runqueue, decreases edf_nr_running.
++ */
++static void dequeue_task_edf(struct rq *rq, struct task_struct *p, int flags)
++{
++	struct edf_rq *edf_rq = &rq->edf;
++	struct sched_edf_entity *edf_se = &p->edf;
++
++	update_curr_edf(rq);
++	list_del_init(&edf_se->run_list);
++	edf_rq->edf_nr_running--;
++}
++
++/*
++ * No time slice, cannot relinquish the CPU to run later
++ */
++static void yield_task_edf(struct rq *rq)
++{
++}
++
++/*
++ * Preempt the current task with a newly woken task if needed
++ */
++static void check_preempt_curr_edf(struct rq *rq, struct task_struct *p,
++				   int flags)
++{
++	if (!rt_task(rq->curr) || p->edf.timeout < rq->curr->edf.timeout)
++		resched_task(rq->curr);
++}
++
++#define EDF_PROB_RESET 4
++/*
++ * Pick the next task to run.
++ */
++static struct task_struct *pick_next_task_edf(struct rq *rq)
++{
++	struct task_struct *p;
++	struct sched_edf_entity *head;
++	struct edf_rq *edf_rq = &rq->edf;
++
++	if (unlikely(!edf_rq->edf_nr_running))
++		return NULL;
++
++	/*
++	 * Use prob_count for efficiency, get_random_bytes is heavyweight
++	 * using lots of memories and even a spinlock
++	 * maintain a variable in each edf_rq to avoid potential race
++	 * conditions in multi-processor architecture
++	 */
++	if (edf_rq->prob_count < EDF_PROB_RESET) {
++		head = list_first_entry(&rq->edf.run_head,
++					struct sched_edf_entity,
++					run_list);
++		p = edf_task_of(head);
++		p->se.exec_start = rq->clock;
++		edf_rq->prob_count++;
++		return p;
++
++	} else {
++		edf_rq->prob_count = 0;
++		return NULL;
++	}
++
++}
++
++/*
++ * A task has just been descheduled.
++ * Read the schedule() function for examples
++ */
++static void put_prev_task_edf(struct rq *rq, struct task_struct *p)
++{
++	update_curr_edf(rq);
++	p->se.exec_start = 0;
++}
++
++#ifdef CONFIG_SMP
++/*
++ * Select the CPU which has the least number of edf tasks
++ */
++static int select_task_rq_edf(struct task_struct *p, int sd_flag, int flags)
++{
++	int i;
++	int orig_cpu = task_cpu(p);
++	int lightest_cpu = orig_cpu;
++	unsigned long orig_num = cpu_rq(orig_cpu)->edf.edf_nr_running;
++	unsigned long lightest_rq_num = orig_num;
++
++	for_each_online_cpu(i) {
++		struct edf_rq *edf_rq = &cpu_rq(i)->edf;
++		if (!cpumask_test_cpu(i, &p->cpus_allowed))
++			continue;
++		if (edf_rq->edf_nr_running < lightest_rq_num) {
++			lightest_cpu = i;
++			lightest_rq_num = edf_rq->edf_nr_running;
++		}
++	}
++
++	return lightest_cpu;
++}
++
++#endif
++
++/*
++ * A task has changed its scheduling class.
++ * Updates the task's exec_start since it's starting a new run period.
++ */
++static void set_curr_task_edf(struct rq *rq)
++{
++	struct task_struct *p = rq->curr;
++	p->se.exec_start = rq->clock;
++}
++
++/*
++ * Resched here to guarantee the pick_next_task is called every
++ * timer interrupt, it is important to make the device responsive with 80-20
++ * probability.
++ */
++static void task_tick_edf(struct rq *rq, struct task_struct *p, int queued)
++{
++	update_curr_edf(rq);
++	resched_task(p);
++}
++
++/*
++ * This function is only called in setprio() (which is not applicable for we
++ * don't use the rt/fair prio) and setscheduler() (if we change the scheduler,
++ * we will not go into the branch of calling this function and go into
++ * the branch of calling switched_to_edf).
++ */
++static void prio_changed_edf(struct rq *rq, struct task_struct *p, int oldprio,
++				int running)
++{
++}
++
++/*
++ * Reset the timeout if we changed to another sched class
++ * inorder not to preempt other non-edf tasks based on timeout
++ * Or you can check whether it is in edf class when comparing the timeout
++ */
++static void switched_from_edf(struct rq *rq, struct task_struct *p, int running)
++{
++	p->edf.timeout = 0;
++}
++
++/*
++ * A task has switched to the sched_edf class.
++ * Preempt the currently running task if it's using fair scheduler
++ * or it has lower priority of timeout.
++ */
++static void switched_to_edf(struct rq *rq, struct task_struct *p, int running)
++{
++	/* If we're already running or changed runqueues, do nothing */
++	if (!p->se.on_rq || rq->curr == p || rq != task_rq(p))
++		return;
++
++	/* Otherwise, see if we take precedence over the currently
++	 * running task (we do if it's not rt or has lower edf priority) */
++	if (!rt_task(rq->curr) || p->edf.timeout < rq->curr->edf.timeout)
++		resched_task(rq->curr);
++}
++
++static const struct sched_class edf_sched_class = {
++	.next			= &fair_sched_class,
++	.enqueue_task		= enqueue_task_edf,
++	.dequeue_task		= dequeue_task_edf,
++	.yield_task		= yield_task_edf,
++
++	.check_preempt_curr	= check_preempt_curr_edf,
++
++	.pick_next_task		= pick_next_task_edf,
++	.put_prev_task		= put_prev_task_edf,
++
++#ifdef CONFIG_SMP
++	.select_task_rq		= select_task_rq_edf,
++#endif
++
++	.switched_from		= switched_from_edf,
++
++	.set_curr_task		= set_curr_task_edf,
++	.task_tick		= task_tick_edf,
++
++	.prio_changed		= prio_changed_edf,
++	.switched_to		= switched_to_edf,
++};
+diff --git a/kernel/sched_rt.c b/kernel/sched_rt.c
+index bac1061..514237a 100644
+--- a/kernel/sched_rt.c
++++ b/kernel/sched_rt.c
+@@ -1512,7 +1512,7 @@ static void set_curr_task_rt(struct rq *rq)
+ }
+ 
+ static const struct sched_class rt_sched_class = {
+-	.next			= &fair_sched_class,
++	.next			= &edf_sched_class,
+ 	.enqueue_task		= enqueue_task_rt,
+ 	.dequeue_task		= dequeue_task_rt,
+ 	.yield_task		= yield_task_rt,
